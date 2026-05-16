@@ -1,428 +1,266 @@
-from __future__ import annotations
-
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
 import lightgbm as lgb
-from lightgbm import LGBMRegressor
-
-from evaluation_metrics import evaluate_regression_arrays, print_in_sample_metrics
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import matplotlib.pyplot as plt
+import json
+from sklearn.model_selection import train_test_split
+from sklearn.cluster import KMeans
+from scipy.spatial.distance import cdist
+from evaluation_metrics import evaluate_regression_arrays, build_evaluation_matrix, print_in_sample_metrics
 
 ROOT = Path(__file__).resolve().parents[1]
-GOLD_PATH = ROOT / "lakehouse" / "gold" / "gold_with_peers.parquet"
-OUTPUT_DIR = ROOT / "output"
-OUTPUT_PATH = OUTPUT_DIR / "TechNova.csv"
-
-
-def _normalize_text(series: pd.Series, fallback: str = "UNKNOWN") -> pd.Series:
-	normalized = series.astype("string").str.strip().fillna(fallback)
-	return normalized.replace("", fallback)
-
-
-def build_outlet_month_frame(df: pd.DataFrame) -> pd.DataFrame:
-	df = df.copy()
-
-	df["Outlet_ID"] = _normalize_text(df["Outlet_ID"])
-	df["Distributor_ID"] = _normalize_text(df["Distributor_ID"])
-	df["Outlet_Type"] = _normalize_text(df["Outlet_Type"])
-	df["Outlet_Size"] = _normalize_text(df["Outlet_Size"])
-
-	# Existing Peer_Group is malformed in this dataset; rebuild a clean peer signature.
-	df["Peer_Group_Clean"] = (
-		df["Outlet_Type"] + "|" + df["Outlet_Size"] + "|" + df["Distributor_ID"]
-	)
-
-	grouped = (
-		df.groupby(["Outlet_ID", "Year", "Month"], as_index=False)
-		.agg(
-			Volume_Liters=("Volume_Liters", "sum"),
-			constrained_share=("is_constrained", "mean"),
-			Distributor_ID=("Distributor_ID", "first"),
-			Outlet_Type=("Outlet_Type", "first"),
-			Outlet_Size=("Outlet_Size", "first"),
-			Cooler_Count=("Cooler_Count", "mean"),
-			Latitude=("Latitude", "mean"),
-			Longitude=("Longitude", "mean"),
-			Holiday_Count=("Holiday_Count", "mean"),
-			poi_bus_stop_1500m=("poi_bus_stop_1500m", "mean"),
-			poi_hospital_1500m=("poi_hospital_1500m", "mean"),
-			poi_market_1500m=("poi_market_1500m", "mean"),
-			poi_school_1500m=("poi_school_1500m", "mean"),
-			poi_supermarket_1500m=("poi_supermarket_1500m", "mean"),
-			poi_tourism_1500m=("poi_tourism_1500m", "mean"),
-			Peer_Group_Clean=("Peer_Group_Clean", "first"),
-		)
-		.sort_values(["Outlet_ID", "Year", "Month"])
-	)
-
-	grouped["ds"] = pd.to_datetime(
-		grouped["Year"].astype(int).astype(str)
-		+ "-"
-		+ grouped["Month"].astype(int).astype(str).str.zfill(2)
-		+ "-01"
-	)
-
-	return grouped
-
-
-def add_time_and_lag_features(df: pd.DataFrame) -> pd.DataFrame:
-	df = df.copy()
-
-	month_angle = 2.0 * np.pi * (df["Month"].astype(float) / 12.0)
-	df["month_sin"] = np.sin(month_angle)
-	df["month_cos"] = np.cos(month_angle)
-	df["year_offset"] = df["Year"].astype(int) - int(df["Year"].min())
-
-	df = df.sort_values(["Outlet_ID", "ds"]).copy()
-	by_outlet = df.groupby("Outlet_ID", observed=True)["Volume_Liters"]
-	df["lag_1"] = by_outlet.shift(1)
-	df["lag_3"] = by_outlet.shift(3)
-	df["lag_6"] = by_outlet.shift(6)
-	df["rolling_3"] = by_outlet.transform(lambda s: s.shift(1).rolling(3, min_periods=1).mean())
-	df["rolling_6"] = by_outlet.transform(lambda s: s.shift(1).rolling(6, min_periods=1).mean())
-
-	return df
-
-
-def add_peer_features(df: pd.DataFrame) -> pd.DataFrame:
-	df = df.copy()
-
-	# For each month and peer group, use robust distribution summaries.
-	peer_month = (
-		df.groupby(["Peer_Group_Clean", "Month"], observed=True)["Volume_Liters"]
-		.agg(
-			peer_month_median="median",
-			peer_month_p75=lambda s: s.quantile(0.75),
-			peer_month_p90=lambda s: s.quantile(0.90),
-		)
-		.reset_index()
-	)
-	df = df.merge(peer_month, on=["Peer_Group_Clean", "Month"], how="left")
-
-	peer_overall = (
-		df.groupby("Peer_Group_Clean", observed=True)["Volume_Liters"]
-		.agg(peer_overall_median="median", peer_overall_p90=lambda s: s.quantile(0.90))
-		.reset_index()
-	)
-	df = df.merge(peer_overall, on="Peer_Group_Clean", how="left")
-	df["peer_rel_perf"] = df["Volume_Liters"] / df["peer_month_median"].clip(lower=1.0)
-
-	return df
-
-
-def train_constraint_model(
-	train_df: pd.DataFrame,
-	feature_cols: list[str],
-	categorical_cols: list[str],
-) -> LGBMRegressor:
-	fit_df = train_df.dropna(subset=feature_cols + ["constrained_share"]).copy()
-
-	model = LGBMRegressor(
-		objective="regression",
-		n_estimators=500,
-		learning_rate=0.04,
-		num_leaves=48,
-		min_child_samples=80,
-		subsample=0.9,
-		colsample_bytree=0.9,
-		random_state=42,
-	)
-
-	model.fit(
-		fit_df[feature_cols],
-		fit_df["constrained_share"],
-		categorical_feature=[c for c in categorical_cols if c in feature_cols],
-	)
-
-	return model
-
-
-def train_frontier_model(
-	train_df: pd.DataFrame,
-	feature_cols: list[str],
-	categorical_cols: list[str],
-) -> LGBMRegressor:
-	fit_df = train_df.dropna(subset=feature_cols + ["Volume_Liters", "constraint_risk_hat"]).copy()
-	fit_df["target_log1p"] = np.log1p(fit_df["Volume_Liters"].clip(lower=0.0))
-
-	# Down-weight observations likely to be censored by constraints.
-	weights = (1.0 - fit_df["constraint_risk_hat"].clip(0.0, 1.0)).clip(lower=0.1)
-
-	model = LGBMRegressor(
-		objective="quantile",
-		alpha=0.92,
-		n_estimators=1000,
-		learning_rate=0.03,
-		num_leaves=64,
-		min_child_samples=80,
-		subsample=0.9,
-		colsample_bytree=0.9,
-		random_state=42,
-	)
-
-	model.fit(
-		fit_df[feature_cols],
-		fit_df["target_log1p"],
-		sample_weight=weights,
-		categorical_feature=[c for c in categorical_cols if c in feature_cols],
-	)
-
-	return model
-
-
-def build_jan_2026_frame(history: pd.DataFrame) -> pd.DataFrame:
-	base_cols = [
-		"Outlet_ID",
-		"Year",
-		"Month",
-		"ds",
-		"Volume_Liters",
-		"Distributor_ID",
-		"Outlet_Type",
-		"Outlet_Size",
-		"Cooler_Count",
-		"Latitude",
-		"Longitude",
-		"Holiday_Count",
-		"poi_bus_stop_1500m",
-		"poi_hospital_1500m",
-		"poi_market_1500m",
-		"poi_school_1500m",
-		"poi_supermarket_1500m",
-		"poi_tourism_1500m",
-		"Peer_Group_Clean",
-	]
-	history_base = history[base_cols].copy()
-
-	outlets = history_base["Outlet_ID"].drop_duplicates().to_frame()
-	latest = (
-		history_base.sort_values("ds")
-		.groupby("Outlet_ID", observed=True)
-		.tail(1)
-		.set_index("Outlet_ID")
-	)
-
-	jan = outlets.copy()
-	jan["Year"] = 2026
-	jan["Month"] = 1
-	jan["ds"] = pd.Timestamp("2026-01-01")
-
-	cols_from_latest = [
-		"Distributor_ID",
-		"Outlet_Type",
-		"Outlet_Size",
-		"Cooler_Count",
-		"Latitude",
-		"Longitude",
-		"Holiday_Count",
-		"poi_bus_stop_1500m",
-		"poi_hospital_1500m",
-		"poi_market_1500m",
-		"poi_school_1500m",
-		"poi_supermarket_1500m",
-		"poi_tourism_1500m",
-		"Peer_Group_Clean",
-	]
-
-	jan = jan.merge(latest[cols_from_latest], left_on="Outlet_ID", right_index=True, how="left")
-
-	jan = add_time_and_lag_features(pd.concat([history_base, jan], ignore_index=True, sort=False))
-	jan = jan[jan["Year"] == 2026].copy()
-	jan = add_peer_features(pd.concat([history_base, jan], ignore_index=True, sort=False))
-	jan = jan[jan["Year"] == 2026].copy()
-
-	# Fill lag features with outlet historical stats when short history exists.
-	hist_stats = (
-		history_base.groupby("Outlet_ID", observed=True)["Volume_Liters"]
-		.agg(hist_median="median", hist_max="max")
-		.reset_index()
-	)
-	jan = jan.merge(hist_stats, on="Outlet_ID", how="left")
-
-	for lag_col in ["lag_1", "lag_3", "lag_6", "rolling_3", "rolling_6"]:
-		jan[lag_col] = jan[lag_col].fillna(jan["hist_median"])
-
-	for col in ["peer_month_median", "peer_month_p75", "peer_overall_median", "peer_overall_p90"]:
-		jan[col] = jan[col].fillna(jan["hist_median"])
-	jan["peer_month_p90"] = jan["peer_month_p90"].fillna(jan["hist_median"])
-
-	return jan
-
-
-def build_outlet_strength(history: pd.DataFrame) -> pd.DataFrame:
-	stable = history[history["constrained_share"] <= 0.2].copy()
-	outlet_strength = (
-		stable.groupby("Outlet_ID", observed=True)["peer_rel_perf"]
-		.median()
-		.clip(lower=0.7, upper=1.7)
-		.rename("outlet_strength")
-		.reset_index()
-	)
-	return outlet_strength
-
-
-def predict_potential(
-	frontier_model: LGBMRegressor,
-	jan_df: pd.DataFrame,
-	feature_cols: list[str],
-) -> pd.DataFrame:
-	pred_log = np.asarray(frontier_model.predict(jan_df[feature_cols]), dtype=float)
-	pred_frontier = np.expm1(pred_log)
-	out = jan_df[["Outlet_ID", "hist_max", "peer_month_p90", "outlet_strength", "constraint_risk_hat"]].copy()
-
-	peer_frontier = out["peer_month_p90"].to_numpy(dtype=float) * out["outlet_strength"].to_numpy(dtype=float)
-
-	# Latent uncapping rule:
-	# potential = max(frontier_model, peer_frontier, historical_max) * (1 + lambda * risk)
-	# where lambda controls additional upside when constraints are likely.
-	base = np.column_stack(
-		[
-			np.asarray(pred_frontier, dtype=float),
-			out["hist_max"].to_numpy(dtype=float),
-			np.asarray(peer_frontier, dtype=float),
-		]
-	)
-	latent_base = np.max(base, axis=1)
-	risk = out["constraint_risk_hat"].clip(lower=0.0, upper=1.0).to_numpy(dtype=float)
-	risk_uplift = 1.0 + (0.35 * risk)
-
-	out["Maximum_Monthly_Liters (Potential)"] = np.clip(latent_base * risk_uplift, a_min=0.0, a_max=None)
-
-	return out[["Outlet_ID", "Maximum_Monthly_Liters (Potential)"]]
-
-
-def save_feature_importance_plot(
-	model: LGBMRegressor,
-	output_path: Path,
-	max_num_features: int = 20,
-) -> None:
-	"""Save feature-importance plot without failing when model has no useful splits."""
-	try:
-		ax = lgb.plot_importance(
-			model,
-			max_num_features=max_num_features,
-			ignore_zero=False,
-		)
-		ax.figure.savefig(output_path, bbox_inches="tight")
-		ax.figure.clf()
-	except ValueError:
-		print(f"Skipping feature importance plot for {output_path.name}: no feature importances available.")
-
-
-def main() -> None:
-	print("Loading data and building features...")
-	if not GOLD_PATH.exists():
-		raise FileNotFoundError(f"Dataset not found: {GOLD_PATH}")
-	else:
-		print(f"Found dataset at: {GOLD_PATH}")
-
-	raw = pd.read_parquet(GOLD_PATH)
-	monthly = build_outlet_month_frame(raw)
-	monthly = add_time_and_lag_features(monthly)
-	monthly = add_peer_features(monthly)
-
-	categorical_cols = ["Distributor_ID", "Outlet_Type", "Outlet_Size", "Peer_Group_Clean"]
-	for col in categorical_cols:
-		monthly[col] = monthly[col].astype("category")
-
-	feature_cols = [
-		"Year",
-		"Month",
-		"year_offset",
-		"month_sin",
-		"month_cos",
-		"lag_1",
-		"lag_3",
-		"lag_6",
-		"rolling_3",
-		"rolling_6",
-		"Cooler_Count",
-		"Latitude",
-		"Longitude",
-		"Holiday_Count",
-		"poi_bus_stop_1500m",
-		"poi_hospital_1500m",
-		"poi_market_1500m",
-		"poi_school_1500m",
-		"poi_supermarket_1500m",
-		"poi_tourism_1500m",
-		"peer_month_median",
-		"peer_month_p75",
-		"peer_month_p90",
-		"peer_overall_median",
-		"peer_overall_p90",
-		"Distributor_ID",
-		"Outlet_Type",
-		"Outlet_Size",
-		"Peer_Group_Clean",
-	]
-
-	# Fill sparse lag/peer fields for early periods while preserving distribution shape.
-	for col in [
-		"lag_1",
-		"lag_3",
-		"lag_6",
-		"rolling_3",
-		"rolling_6",
-		"peer_month_median",
-		"peer_month_p75",
-		"peer_month_p90",
-		"peer_overall_median",
-		"peer_overall_p90",
-	]:
-		monthly[col] = monthly[col].fillna(monthly["Volume_Liters"].median())
-
-	train_df = monthly.loc[monthly["Year"] <= 2025].copy()
-
-	print("Training constraint model...")
-
-	constraint_model = train_constraint_model(
-		train_df=train_df,
-		feature_cols=feature_cols,
-		categorical_cols=categorical_cols,
-	)
-	monthly_risk = np.asarray(constraint_model.predict(monthly[feature_cols]), dtype=float)
-	monthly["constraint_risk_hat"] = np.clip(monthly_risk, 0.0, 1.0)
-	train_df = monthly.loc[monthly["Year"] <= 2025].copy()
-
-	print("Training frontier model...")
-
-	frontier_model = train_frontier_model(
-		train_df=train_df,
-		feature_cols=feature_cols,
-		categorical_cols=categorical_cols,
-	)
-
-	# In-sample metrics on liters scale for quick training diagnostics.
-	y_train_liters = train_df["Volume_Liters"].to_numpy(dtype=float)
-	y_train_pred_liters = np.expm1(
-		np.asarray(frontier_model.predict(train_df[feature_cols]), dtype=float)
-	)
-	train_metrics = evaluate_regression_arrays(y_train_liters, y_train_pred_liters)
-	print_in_sample_metrics(train_metrics)
-
-	jan_2026 = build_jan_2026_frame(monthly)
-	jan_risk = np.asarray(constraint_model.predict(jan_2026[feature_cols]), dtype=float)
-	jan_2026["constraint_risk_hat"] = np.clip(jan_risk, 0.0, 1.0)
-	outlet_strength = build_outlet_strength(monthly)
-	jan_2026 = jan_2026.merge(outlet_strength, on="Outlet_ID", how="left")
-	jan_2026["outlet_strength"] = jan_2026["outlet_strength"].fillna(1.0)
-
-	for col in categorical_cols:
-		jan_2026[col] = jan_2026[col].astype("category")
-
-	predictions = predict_potential(
-		frontier_model=frontier_model,
-		jan_df=jan_2026,
-		feature_cols=feature_cols,
-	)
-
-	predictions.to_csv(OUTPUT_PATH, index=False)
-	print("Prediction complete.")
-	print(f"Saved predictions to: {OUTPUT_PATH}")
-	print(f"Rows: {len(predictions):,}")
-
-
-if __name__ == "__main__":
-	main()
+
+df = pd.read_parquet(ROOT / 'lakehouse/gold/master_features.parquet')
+
+aggregation_rules = {
+    'Volume_Liters': 'sum',    
+    'Total_Bill_Value': 'sum',  
+    'Cooler_Count': 'first',     
+    'Outlet_Size': 'first',       
+    'Outlet_Type': 'first',        
+    'Latitude': 'first',            
+    'Longitude': 'first',            
+    'Seasonality_Index': 'first',     
+    'Holiday_Count': 'first',         
+    'poi_bus_stop_1500m': 'first',    
+    'poi_hospital_1500m': 'first',    
+    'poi_market_1500m': 'first',      
+    'poi_school_1500m': 'first',      
+    'poi_supermarket_1500m': 'first', 
+    'poi_tourism_1500m': 'first'
+}
+
+df_monthly = df.groupby(['Outlet_ID', 'Year', 'Month']).agg(aggregation_rules).reset_index()
+
+#calculate hist max
+historical_max = df_monthly.groupby('Outlet_ID')['Volume_Liters'].max().reset_index()
+
+historical_max.rename(columns={'Volume_Liters': 'Historical_Max_Volume'}, inplace=True)
+df_monthly = df_monthly.merge(historical_max, on='Outlet_ID', how='left')
+
+outlet_agg = df_monthly.groupby('Outlet_ID').agg(
+    cv        = ('Volume_Liters', lambda x: x.std() / x.mean() if x.mean() > 0 else 0),
+    repeat_r  = ('Volume_Liters', lambda x: 1 - x.nunique() / len(x)),
+    round_r   = ('Volume_Liters', lambda x: (x % 10 == 0).mean()),
+).reset_index()
+
+outlet_agg['is_censored'] = (
+    (outlet_agg['cv'] < 0.15).astype(int) +
+    (outlet_agg['repeat_r'] > 0.5).astype(int) +
+    (outlet_agg['round_r'] > 0.7).astype(int)
+) >= 2
+
+df_monthly = df_monthly.merge(outlet_agg[['Outlet_ID', 'is_censored']], on='Outlet_ID')
+
+cohort_p90 = df_monthly.groupby(['Outlet_Type', 'Outlet_Size'])['Volume_Liters'] \
+    .quantile(0.90).reset_index().rename(columns={'Volume_Liters': 'cohort_p90'})
+
+df_monthly = df_monthly.merge(cohort_p90, on=['Outlet_Type', 'Outlet_Size'], how='left')
+
+outlet_level = df_monthly.groupby('Outlet_ID').agg(
+    Cooler_Count         = ('Cooler_Count', 'first'),
+    Latitude             = ('Latitude', 'first'),
+    Longitude            = ('Longitude', 'first'),
+    Outlet_Size          = ('Outlet_Size', 'first'),
+    Outlet_Type          = ('Outlet_Type', 'first'),
+    poi_bus_stop_1500m   = ('poi_bus_stop_1500m', 'first'),
+    poi_hospital_1500m   = ('poi_hospital_1500m', 'first'),
+    poi_market_1500m     = ('poi_market_1500m', 'first'),
+    poi_school_1500m     = ('poi_school_1500m', 'first'),
+    poi_supermarket_1500m= ('poi_supermarket_1500m', 'first'),
+    poi_tourism_1500m    = ('poi_tourism_1500m', 'first'),
+    cohort_p90           = ('cohort_p90', 'first'),
+    is_censored          = ('is_censored', 'first'),
+    target               = ('Volume_Liters', 'max'),
+).reset_index()
+
+outlet_level['target'] = np.where(
+    outlet_level['is_censored'],
+    outlet_level['cohort_p90'],
+    outlet_level['target']
+)
+
+# make it numerical cause feature importance without this is 9
+size_order = {'Small': 1, 'Medium': 2, 'Large': 3, 'Extra Large': 4}
+outlet_level['Outlet_Size_Ord'] = outlet_level['Outlet_Size'].astype(str).map(size_order).fillna(1)
+
+coords = outlet_level[['Latitude', 'Longitude']].values
+
+# find natural clusters in your actual outlet distribution
+kmeans = KMeans(n_clusters=8, random_state=42, n_init=10)
+outlet_level['cluster'] = kmeans.fit_predict(coords)
+centers = kmeans.cluster_centers_
+
+# distance to nearest cluster center = urbanness proxy
+dists = cdist(coords, centers, metric='euclidean')
+outlet_level['dist_to_nearest_center'] = dists.min(axis=1)
+
+# density of each cluster = how many outlets share this center
+cluster_density = outlet_level['cluster'].value_counts().rename('cluster_density')
+outlet_level = outlet_level.merge(cluster_density, left_on='cluster', right_index=True)
+
+cap = outlet_level['target'].quantile(0.99)
+outlet_level['target'] = outlet_level['target'].clip(upper=cap)
+
+features = [
+    'Cooler_Count',
+    'poi_bus_stop_1500m', 'poi_hospital_1500m', 'poi_market_1500m',
+    'poi_school_1500m', 'poi_supermarket_1500m', 'poi_tourism_1500m',
+    'Outlet_Size_Ord', 'Outlet_Type', 'cohort_p90', 'dist_to_nearest_center','cluster_density', 'cluster'
+]
+cat_cols = ['Outlet_Type']
+
+X_train = outlet_level[features]
+y_train = outlet_level['target']   # already the ceiling
+
+# Drop quantile objective — you've already built the ceiling into y_train
+# Use regular regression to predict it cleanly
+model = lgb.LGBMRegressor(
+    objective='regression',
+    n_estimators=500,
+    learning_rate=0.05,
+    max_depth=6,
+    num_leaves=31,
+    random_state=42,
+    n_jobs=-1
+)
+model.fit(X_train, y_train, categorical_feature=cat_cols)
+
+outlets_2026 = outlet_level[['Outlet_ID'] + features].copy()
+# build Outlet -> Distributor mapping from latest available transaction per outlet
+
+tx = pd.read_parquet(ROOT / 'lakehouse/silver/transactions_history.parquet')
+
+outlet_dist = (
+    tx.sort_values(['Year', 'Month'])
+      .groupby('Outlet_ID', as_index=False)
+      .tail(1)[['Outlet_ID', 'Distributor_ID']]
+      .drop_duplicates('Outlet_ID')
+)
+
+# January seasonality per distributor (latest year)
+distributor_seasonality_details = pd.read_parquet(ROOT / 'lakehouse/silver/distributor_seasonality_details.parquet')
+jan_season = (
+    distributor_seasonality_details[distributor_seasonality_details['Month'] == 1]
+    .sort_values('Year')
+    .drop_duplicates('Distributor_ID', keep='last')[['Distributor_ID', 'Seasonality_Index']]
+)
+
+outlets_2026 = outlets_2026.merge(outlet_dist, on='Outlet_ID', how='left')
+outlets_2026 = outlets_2026.merge(jan_season, on='Distributor_ID', how='left')
+
+season_map = {'Favorable': 1.2, 'Moderate': 1.0, 'Un-Favorable': 0.8}
+outlets_2026['season_mult'] = outlets_2026['Seasonality_Index'].astype(str).map(season_map).fillna(1.0)
+
+outlets_2026['Maximum_Monthly_Liters'] = (
+    model.predict(outlets_2026[features]) * outlets_2026['season_mult']
+)
+
+outlets_2026['Maximum_Monthly_Liters'] = np.maximum(
+    outlets_2026['Maximum_Monthly_Liters'],
+    outlet_level.set_index('Outlet_ID')['target'].reindex(outlets_2026['Outlet_ID']).values
+)
+
+outlets_2026['Maximum_Monthly_Liters'] = outlets_2026['Maximum_Monthly_Liters'].clip(lower=0).round(2)
+
+# ============================================================
+# EVALUATION METRICS & DIAGNOSTICS
+# ============================================================
+
+# Generate training predictions for evaluation
+y_train_true = outlet_level['target'].values
+y_train_pred = model.predict(outlet_level[features])
+
+# Compute in-sample metrics
+train_metrics = evaluate_regression_arrays(y_train_true, y_train_pred, name="Maximum_Monthly_Liters")
+print_in_sample_metrics(train_metrics)
+
+# Build evaluation matrix by volume segment
+eval_matrix = build_evaluation_matrix(y_train_true, y_train_pred, quantiles=[0.25, 0.5, 0.75])
+
+# Compute residuals for analysis
+residuals = y_train_pred - y_train_true
+abs_errors = np.abs(residuals)
+ape = np.abs((y_train_pred - y_train_true) / (y_train_true + 1e-6))
+
+# Create comprehensive assessment summary
+assessment = {
+    'Model': 'LightGBM Regression',
+    'Target': 'Maximum Monthly Liters (Outlet Potential)',
+    'Training_Samples': int(len(outlet_level)),
+    'Hyperparameters': {
+        'Objective': 'regression',
+        'Learning_Rate': 0.05,
+        'N_Estimators': 500,
+        'Max_Depth': 6,
+        'Num_Leaves': 31,
+        'Random_State': 42,
+    },
+    'Features_Used': len(features),
+    'Performance_Metrics': {
+        'MAE_Liters': float(train_metrics['mean_absolute_error']),
+        'RMSE_Liters': float(train_metrics['root_mean_squared_error']),
+        'MAPE_Percent': f"{train_metrics['mean_absolute_percentage_error']*100:.2f}%",
+        'R2_Score': float(train_metrics['r2_score']),
+        'Normalized_RMSE': float(train_metrics['normalized_rmse']),
+        'Bias_Liters': float(train_metrics['bias']),
+        'Median_AE_Liters': float(train_metrics['median_absolute_error']),
+    },
+    'Target_Distribution': {
+        'Min_Liters': float(train_metrics['min_value']),
+        'Max_Liters': float(train_metrics['max_value']),
+        'Mean_Liters': float(train_metrics['mean_value']),
+        'Std_Dev': float(np.std(y_train_true)),
+    },
+    'Residuals_Summary': {
+        'Mean': float(np.mean(residuals)),
+        'Std': float(np.std(residuals)),
+        'Min': float(np.min(residuals)),
+        'Max': float(np.max(residuals)),
+        'Median': float(np.median(residuals)),
+    },
+}
+
+# Save evaluation outputs
+output_eval_dir = ROOT / 'output' / 'evaluation'
+output_eval_dir.mkdir(parents=True, exist_ok=True)
+
+# 1. Save evaluation matrix by volume segment
+eval_matrix.to_csv(output_eval_dir / 'model_evaluation_matrix.csv', index=False)
+
+# 2. Save model assessment as JSON
+with open(output_eval_dir / 'model_metrics.json', 'w') as f:
+    json.dump(assessment, f, indent=2)
+
+# 3. Save feature importance
+feature_importance_df = pd.DataFrame({
+    'Feature': features,
+    'Importance': model.feature_importances_,
+}).sort_values('Importance', ascending=False)
+feature_importance_df.to_csv(output_eval_dir / 'feature_importance.csv', index=False)
+
+# 4. Save residual analysis (detailed)
+residual_df = pd.DataFrame({
+    'Outlet_ID': outlet_level['Outlet_ID'],
+    'Outlet_Type': outlet_level['Outlet_Type'],
+    'Outlet_Size': outlet_level['Outlet_Size'],
+    'Actual_Liters': y_train_true,
+    'Predicted_Liters': y_train_pred,
+    'Residual_Liters': residuals,
+    'Abs_Error': abs_errors,
+    'APE_Percent': ape * 100,
+}).sort_values('Abs_Error', ascending=False)
+residual_df.to_csv(output_eval_dir / 'residual_analysis.csv', index=False)
+
+print(f"\nEvaluation files saved to: {output_eval_dir}/")
+print(f"  [OK] model_evaluation_matrix.csv")
+print(f"  [OK] model_metrics.json")
+print(f"  [OK] feature_importance.csv")
+print(f"  [OK] residual_analysis.csv")
+
+# Save feature importance visualization
+lgb.plot_importance(model, max_num_features=15)
+plt.savefig(ROOT / 'output' / 'feature_importance.png', bbox_inches='tight')
+plt.close()
+print(f"  [OK] feature_importance.png")

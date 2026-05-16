@@ -1,0 +1,36 @@
+{
+  "Model": "LightGBM Regression",
+  "Target": "Maximum Monthly Liters (Outlet Potential)",
+  "Training_Samples": 19764,
+  "Hyperparameters": {
+    "Objective": "regression",
+    "Learning_Rate": 0.05,
+    "N_Estimators": 500,
+    "Max_Depth": 6,
+    "Num_Leaves": 31,
+    "Random_State": 42
+  },
+  "Features_Used": 13,
+  "Performance_Metrics": {
+    "MAE_Liters": 42.46053752508864,
+    "RMSE_Liters": 98.68449704369246,
+    "MAPE_Percent": "18.30%",
+    "R2_Score": 0.9542909938014204,
+    "Normalized_RMSE": 0.048337692938353216,
+    "Bias_Liters": 0.0003132370166083219,
+    "Median_AE_Liters": 25.278376696491506
+  },
+  "Target_Distribution": {
+    "Min_Liters": 28.0510196685791,
+    "Max_Liters": 2069.615087890625,
+    "Mean_Liters": 389.48800358906425,
+    "Std_Dev": 461.5811262891721
+  },
+  "Residuals_Summary": {
+    "Mean": 0.0003132370166083219,
+    "Std": 98.68449704319532,
+    "Min": -906.9656410109706,
+    "Max": 989.90086302185,
+    "Median": 8.471967358587037
+  }
+}
