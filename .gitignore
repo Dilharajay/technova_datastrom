@@ -12,3 +12,7 @@ wheels/
 # ignore data files
 data/
 lakehouse/
+files
+
+# map data
+sri-lanka-260515.osm.pbf
