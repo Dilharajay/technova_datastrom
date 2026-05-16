@@ -1,0 +1,14 @@
+{
+  "mean_absolute_error": 92.0949167941017,
+  "root_mean_squared_error": 131.8364041581773,
+  "mean_absolute_percentage_error": 921492600868.6837,
+  "normalized_rmse": 0.012606344915096898,
+  "r2_score": 0.8807062885165166,
+  "mean_absolute_scaled_error": 0.7796774591871231,
+  "bias": 89.64146079001408,
+  "median_absolute_error": 68.64577934496009,
+  "min_value": 0.0,
+  "max_value": 10457.9404296875,
+  "mean_value": 275.94475677689553,
+  "n_samples": 449700
+}
