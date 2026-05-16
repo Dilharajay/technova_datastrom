@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import lightgbm as lgb
 from lightgbm import LGBMRegressor
 
 from evaluation_metrics import evaluate_regression_arrays, print_in_sample_metrics
@@ -291,9 +292,30 @@ def predict_potential(
 	return out[["Outlet_ID", "Maximum_Monthly_Liters (Potential)"]]
 
 
+def save_feature_importance_plot(
+	model: LGBMRegressor,
+	output_path: Path,
+	max_num_features: int = 20,
+) -> None:
+	"""Save feature-importance plot without failing when model has no useful splits."""
+	try:
+		ax = lgb.plot_importance(
+			model,
+			max_num_features=max_num_features,
+			ignore_zero=False,
+		)
+		ax.figure.savefig(output_path, bbox_inches="tight")
+		ax.figure.clf()
+	except ValueError:
+		print(f"Skipping feature importance plot for {output_path.name}: no feature importances available.")
+
+
 def main() -> None:
+	print("Loading data and building features...")
 	if not GOLD_PATH.exists():
 		raise FileNotFoundError(f"Dataset not found: {GOLD_PATH}")
+	else:
+		print(f"Found dataset at: {GOLD_PATH}")
 
 	raw = pd.read_parquet(GOLD_PATH)
 	monthly = build_outlet_month_frame(raw)
@@ -353,6 +375,8 @@ def main() -> None:
 
 	train_df = monthly.loc[monthly["Year"] <= 2025].copy()
 
+	print("Training constraint model...")
+
 	constraint_model = train_constraint_model(
 		train_df=train_df,
 		feature_cols=feature_cols,
@@ -361,6 +385,8 @@ def main() -> None:
 	monthly_risk = np.asarray(constraint_model.predict(monthly[feature_cols]), dtype=float)
 	monthly["constraint_risk_hat"] = np.clip(monthly_risk, 0.0, 1.0)
 	train_df = monthly.loc[monthly["Year"] <= 2025].copy()
+
+	print("Training frontier model...")
 
 	frontier_model = train_frontier_model(
 		train_df=train_df,
@@ -392,7 +418,6 @@ def main() -> None:
 		feature_cols=feature_cols,
 	)
 
-	OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 	predictions.to_csv(OUTPUT_PATH, index=False)
 	print("Prediction complete.")
 	print(f"Saved predictions to: {OUTPUT_PATH}")
