@@ -120,3 +120,27 @@ def fix_outlet_type(df, col='Outlet_Type', dataset_name=None, quarantine_unknown
         return df[~unknown_mask]
     else:
         return df
+
+
+def fix_outlet_size(df, col='Outlet_Size', dataset_name=None, quarantine_unknown=False):
+    corrections = {
+        'small': 'Small'
+    }
+
+    valid_sizes = {'Extra Large', 'Large', 'Medium', 'Small'}
+
+    df = df.copy()
+    
+    df[col] = df[col].astype(str).str.strip()
+    
+    df[col] = df[col].replace(corrections)
+
+    if quarantine_unknown and dataset_name:
+        unknown_mask = ~df[col].isin(valid_sizes)
+        if unknown_mask.any():
+            qurantine(df[unknown_mask], dataset_name, f"{col}_unknown_value")
+        df = df[~unknown_mask]
+    
+    df[col] = df[col].astype('category')
+    
+    return df
